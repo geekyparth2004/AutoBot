@@ -15,6 +15,7 @@ const config = {
 };
 let autoRun = false;
 let loopHandle = null;
+let cycleRunning = false;
 
 function log(...args) {
   console.log('[Amdocs Training Bot]', ...args);
@@ -385,6 +386,9 @@ async function playAndCompleteVideo() {
 
   return new Promise((resolve) => {
     let ended = false;
+    let lastTime = 0;
+    let timeProgressed = false;
+
     const onEnded = () => {
       ended = true;
       log('Video ended naturally');
@@ -393,6 +397,24 @@ async function playAndCompleteVideo() {
     };
     const onError = () => {
       log('Video error occurred');
+    };
+    const onTimeUpdate = () => {
+      if (video.currentTime > lastTime + 0.5) {
+        timeProgressed = true;
+      }
+      lastTime = video.currentTime;
+      if (video.duration && video.currentTime >= video.duration - 0.5) {
+        ended = true;
+        log('Video reached end time');
+        cleanup();
+        resolve(true);
+      }
+    };
+    const onPlaying = () => {
+      log('Video playback started, currentTime:', video.currentTime.toFixed(1));
+    };
+    const onPause = () => {
+      log('Video paused at', video.currentTime.toFixed(1));
     };
     const attemptSeek = async () => {
       if (video.duration && !video.paused) {
@@ -407,22 +429,32 @@ async function playAndCompleteVideo() {
     const cleanup = () => {
       video.removeEventListener('ended', onEnded);
       video.removeEventListener('error', onError);
+      video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('playing', onPlaying);
+      video.removeEventListener('pause', onPause);
     };
 
     video.addEventListener('ended', onEnded);
     video.addEventListener('error', onError);
+    video.addEventListener('timeupdate', onTimeUpdate);
+    video.addEventListener('playing', onPlaying);
+    video.addEventListener('pause', onPause);
+
     setTimeout(async () => {
-      if (!ended) {
+      if (!ended && !timeProgressed) {
+        log('Video not progressing after 4 seconds, attempting seek/play again');
+        await attemptPlayOnVideo(video);
         await attemptSeek();
       }
     }, 4000);
+
     setTimeout(() => {
       if (!ended) {
         log('Video wait timeout, treating as complete');
         cleanup();
         resolve(true);
       }
-    }, 90_000);
+    }, 180_000);
   });
 }
 
@@ -465,10 +497,29 @@ function startLoop() {
   if (loopHandle) {
     return;
   }
-  loopHandle = setInterval(() => {
-    runCycle().catch((error) => log('Loop error:', error));
-  }, 8000);
-  runCycle().catch((error) => log('Initial run error:', error));
+
+  async function loop() {
+    if (!autoRun) {
+      loopHandle = null;
+      return;
+    }
+    if (cycleRunning) {
+      return;
+    }
+    cycleRunning = true;
+    try {
+      await runCycle();
+    } catch (error) {
+      log('Loop error:', error);
+    } finally {
+      cycleRunning = false;
+    }
+    if (autoRun) {
+      loopHandle = setTimeout(loop, 2000);
+    }
+  }
+
+  loopHandle = setTimeout(loop, 0);
 }
 
 function stopLoop() {
