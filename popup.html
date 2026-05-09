@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Amdocs Training Bot</title>
+  <style>
+    body { font-family: Arial, sans-serif; width: 280px; padding: 16px; margin: 0; }
+    h1 { font-size: 18px; margin: 0 0 10px; }
+    button { width: 100%; padding: 10px; font-size: 14px; border: none; border-radius: 6px; cursor: pointer; }
+    button.start { background: #5b2cff; color: white; margin-bottom: 10px; }
+    button.stop { background: #d32f2f; color: white; }
+    p { margin: 8px 0; font-size: 13px; line-height: 1.4; }
+    .status { margin-top: 10px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Amdocs Course Auto Player</h1>
+  <button id="toggleButton" class="start">Start Automation</button>
+  <button id="refreshButton" style="background:#1976d2;color:#fff;">Refresh Page</button>
+  <p>Click Start to let the extension identify the next unwatched video, play it, and continue until the course progress reaches 100%.</p>
+  <div class="status" id="status">Status: idle</div>
+  <script src="popup.js"></script>
+</body>
+</html>
