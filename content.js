@@ -359,6 +359,96 @@ async function waitForVideoElement(timeout = 20000) {
   return null;
 }
 
+function hasFiniteVideoDuration(video) {
+  return Boolean(video && Number.isFinite(video.duration) && video.duration > 0);
+}
+
+function isVideoAtEnd(video) {
+  if (!video) {
+    return false;
+  }
+  if (video.ended) {
+    return true;
+  }
+  if (!hasFiniteVideoDuration(video)) {
+    return false;
+  }
+  return video.currentTime >= Math.max(video.duration - 0.5, 0);
+}
+
+async function waitForVideoMetadata(video, timeout = 15000) {
+  if (!video) {
+    return false;
+  }
+  if (hasFiniteVideoDuration(video)) {
+    return true;
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+
+    const onMetadata = () => {
+      if (hasFiniteVideoDuration(video)) {
+        finish(true);
+      }
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      video.removeEventListener('loadedmetadata', onMetadata);
+      video.removeEventListener('durationchange', onMetadata);
+    };
+
+    const timer = setTimeout(() => finish(hasFiniteVideoDuration(video)), timeout);
+
+    video.addEventListener('loadedmetadata', onMetadata);
+    video.addEventListener('durationchange', onMetadata);
+  });
+}
+
+function getVideoWaitBudgetMs(video) {
+  if (!hasFiniteVideoDuration(video)) {
+    return 15 * 60 * 1000;
+  }
+
+  const remainingSeconds = Math.max(video.duration - video.currentTime, 0);
+  return Math.min(Math.max((remainingSeconds + 45) * 1000, 180_000), 15 * 60 * 1000);
+}
+
+async function waitForCompletionSignal(item, initialProgress, timeout = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (isWatched(item)) {
+      log('Lesson marked watched in the sidebar');
+      return true;
+    }
+
+    const currentProgress = getProgressPercent();
+    if (
+      initialProgress !== null &&
+      currentProgress !== null &&
+      currentProgress > initialProgress
+    ) {
+      log('Course progress increased from', initialProgress, 'to', currentProgress);
+      return true;
+    }
+
+    await sleep(1000);
+  }
+
+  log('No completion signal detected after video end; continuing anyway');
+  return true;
+}
+
 async function waitForPageReady(timeout = 20000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
@@ -370,7 +460,7 @@ async function waitForPageReady(timeout = 20000) {
   return document.readyState === 'complete';
 }
 
-async function playAndCompleteVideo() {
+async function playAndCompleteVideo(item, initialProgress) {
   const playButton = findPlayButton();
   if (playButton) {
     log('Clicking play button / control');
@@ -383,50 +473,57 @@ async function playAndCompleteVideo() {
   }
 
   await attemptPlayOnVideo(video);
+  await waitForVideoMetadata(video);
+
+  if (isVideoAtEnd(video)) {
+    log('Video is already at the end');
+    return waitForCompletionSignal(item, initialProgress);
+  }
 
   return new Promise((resolve) => {
-    let ended = false;
+    let settled = false;
     let lastTime = 0;
-    let timeProgressed = false;
+    let lastProgressAt = Date.now();
+    const start = Date.now();
+
+    const finish = async (result, reason) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      log(reason);
+      cleanup();
+      if (result) {
+        resolve(await waitForCompletionSignal(item, initialProgress));
+        return;
+      }
+      resolve(false);
+    };
 
     const onEnded = () => {
-      ended = true;
-      log('Video ended naturally');
-      cleanup();
-      resolve(true);
+      finish(true, 'Video ended naturally');
     };
     const onError = () => {
       log('Video error occurred');
     };
     const onTimeUpdate = () => {
-      if (video.currentTime > lastTime + 0.5) {
-        timeProgressed = true;
+      if (video.currentTime > lastTime + 0.25) {
+        lastProgressAt = Date.now();
       }
       lastTime = video.currentTime;
-      if (video.duration && video.currentTime >= video.duration - 0.5) {
-        ended = true;
-        log('Video reached end time');
-        cleanup();
-        resolve(true);
+      if (isVideoAtEnd(video)) {
+        finish(true, 'Video reached end time');
       }
     };
     const onPlaying = () => {
+      lastProgressAt = Date.now();
       log('Video playback started, currentTime:', video.currentTime.toFixed(1));
     };
     const onPause = () => {
       log('Video paused at', video.currentTime.toFixed(1));
     };
-    const attemptSeek = async () => {
-      if (video.duration && !video.paused) {
-        try {
-          video.currentTime = Math.max(video.duration - 0.5, 0);
-          log('Seeking video to end');
-        } catch (err) {
-          log('Seek failed:', err);
-        }
-      }
-    };
     const cleanup = () => {
+      clearInterval(watchdog);
       video.removeEventListener('ended', onEnded);
       video.removeEventListener('error', onError);
       video.removeEventListener('timeupdate', onTimeUpdate);
@@ -440,21 +537,32 @@ async function playAndCompleteVideo() {
     video.addEventListener('playing', onPlaying);
     video.addEventListener('pause', onPause);
 
-    setTimeout(async () => {
-      if (!ended && !timeProgressed) {
-        log('Video not progressing after 4 seconds, attempting seek/play again');
-        await attemptPlayOnVideo(video);
-        await attemptSeek();
+    const watchdog = setInterval(async () => {
+      if (settled) {
+        return;
       }
-    }, 4000);
 
-    setTimeout(() => {
-      if (!ended) {
-        log('Video wait timeout, treating as complete');
-        cleanup();
-        resolve(true);
+      if (isVideoAtEnd(video)) {
+        await finish(true, 'Video reached end time');
+        return;
       }
-    }, 180_000);
+
+      if (!video.ended && video.paused) {
+        log('Video paused before completion, attempting to resume');
+        await attemptPlayOnVideo(video);
+        return;
+      }
+
+      if (Date.now() - lastProgressAt > 10000) {
+        log('Video playback stalled, attempting to resume');
+        await attemptPlayOnVideo(video);
+        lastProgressAt = Date.now();
+      }
+
+      if (Date.now() - start > getVideoWaitBudgetMs(video)) {
+        await finish(false, 'Video wait timed out before natural completion');
+      }
+    }, 3000);
   });
 }
 
@@ -486,7 +594,7 @@ async function runCycle() {
   }
   await sleep(2000);
 
-  const completed = await playAndCompleteVideo();
+  const completed = await playAndCompleteVideo(item, progress);
   if (completed) {
     log('Video should be complete; waiting for auto-refresh or other page update.');
     await sleep(5000);
