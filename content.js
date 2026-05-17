@@ -25,6 +25,22 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isPageVisibleForTracking() {
+  return document.visibilityState === 'visible' && !document.hidden && document.hasFocus();
+}
+
+async function waitForVisiblePlaybackContext(timeout = 120000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (isPageVisibleForTracking()) {
+      return true;
+    }
+    log('Waiting for the course tab to stay visible and focused so watch time can be counted');
+    await sleep(1000);
+  }
+  return isPageVisibleForTracking();
+}
+
 function getProgressPercent() {
   const progressEl = document.querySelector(config.progressTextSelector);
   if (progressEl && progressEl.textContent) {
@@ -116,26 +132,6 @@ function findActiveLessonInModule(module) {
   if (active && getVideoItemsWithinModule(module).includes(active)) {
     return active;
   }
-  return null;
-}
-
-function findNextVideoAfterActive(module) {
-  const active = findActiveLessonInModule(module);
-  if (!active) {
-    return null;
-  }
-  const videos = getVideoItemsWithinModule(module);
-  const index = videos.indexOf(active);
-  if (index >= 0 && index + 1 < videos.length) {
-    const next = videos[index + 1];
-    if (!isWatched(next)) {
-      return next;
-    }
-  }
-  return null;
-}
-
-function findActiveLessonInModule(module) {
   const watchedVideos = getVideoItemsWithinModule(module).filter(isWatched);
   return watchedVideos.length ? watchedVideos[watchedVideos.length - 1] : null;
 }
@@ -289,6 +285,32 @@ function clickElement(el) {
   }
 }
 
+function dispatchInteractionSequence(el) {
+  if (!el) {
+    return;
+  }
+  const events = [
+    ['pointerover', { bubbles: true, cancelable: true, pointerType: 'mouse' }],
+    ['mouseover', { bubbles: true, cancelable: true }],
+    ['pointerenter', { bubbles: true, cancelable: true, pointerType: 'mouse' }],
+    ['mouseenter', { bubbles: true, cancelable: true }],
+    ['pointerdown', { bubbles: true, cancelable: true, pointerType: 'mouse', button: 0, buttons: 1 }],
+    ['mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1 }],
+    ['pointerup', { bubbles: true, cancelable: true, pointerType: 'mouse', button: 0, buttons: 0 }],
+    ['mouseup', { bubbles: true, cancelable: true, button: 0, buttons: 0 }],
+    ['click', { bubbles: true, cancelable: true, button: 0 }]
+  ];
+
+  for (const [type, init] of events) {
+    try {
+      const EventCtor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+      el.dispatchEvent(new EventCtor(type, init));
+    } catch (error) {
+      log('Interaction dispatch failed for', type, error);
+    }
+  }
+}
+
 function findPlayButton() {
   const button = document.querySelector(config.playButtonSelector);
   if (button) {
@@ -329,20 +351,58 @@ function findPlayButton() {
   return insideVideo || candidates[0] || null;
 }
 
+function findVideoInteractionTarget(video) {
+  if (!video) {
+    return null;
+  }
+  return video.closest(config.videoContainerSelector) || video.parentElement || video;
+}
+
+function pulseWatchActivity(video) {
+  const target = findVideoInteractionTarget(video) || video;
+  if (!target) {
+    return;
+  }
+
+  target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+  dispatchInteractionSequence(target);
+  if (video && target !== video) {
+    dispatchInteractionSequence(video);
+  }
+  window.dispatchEvent(new Event('focus'));
+  document.dispatchEvent(new Event('visibilitychange'));
+}
+
 async function attemptPlayOnVideo(video) {
   if (!video) {
     return false;
   }
+  const target = findVideoInteractionTarget(video);
+  if (target) {
+    dispatchInteractionSequence(target);
+  }
+  dispatchInteractionSequence(video);
   try {
-    video.muted = true;
     await video.play();
     log('Requested video play programmatically');
   } catch (error) {
     log('Programmatic video play failed:', error);
   }
   if (video.paused) {
-    log('Video is still paused, clicking video element');
-    clickElement(video);
+    log('Video is still paused, clicking the player surface');
+    if (target) {
+      clickElement(target);
+    }
+    dispatchInteractionSequence(video);
+  }
+  if (video.paused) {
+    try {
+      video.muted = true;
+      await video.play();
+      log('Retried playback in muted mode as a fallback');
+    } catch (error) {
+      log('Muted fallback play failed:', error);
+    }
   }
   return !video.paused;
 }
@@ -445,8 +505,8 @@ async function waitForCompletionSignal(item, initialProgress, timeout = 30000) {
     await sleep(1000);
   }
 
-  log('No completion signal detected after video end; continuing anyway');
-  return true;
+  log('No completion signal detected after video end; the site may not have counted this watch');
+  return false;
 }
 
 async function waitForPageReady(timeout = 20000) {
@@ -461,10 +521,17 @@ async function waitForPageReady(timeout = 20000) {
 }
 
 async function playAndCompleteVideo(item, initialProgress) {
+  const visible = await waitForVisiblePlaybackContext();
+  if (!visible) {
+    log('The course tab did not stay visible and focused long enough to count watch time');
+    return false;
+  }
+
   const playButton = findPlayButton();
   if (playButton) {
     log('Clicking play button / control');
     clickElement(playButton);
+    dispatchInteractionSequence(playButton);
   }
   const video = await waitForVideoElement();
   if (!video) {
@@ -472,6 +539,7 @@ async function playAndCompleteVideo(item, initialProgress) {
     return false;
   }
 
+  pulseWatchActivity(video);
   await attemptPlayOnVideo(video);
   await waitForVideoMetadata(video);
 
@@ -542,6 +610,11 @@ async function playAndCompleteVideo(item, initialProgress) {
         return;
       }
 
+      if (!isPageVisibleForTracking()) {
+        log('Playback is running without an active visible tab; waiting before retrying interaction');
+        return;
+      }
+
       if (isVideoAtEnd(video)) {
         await finish(true, 'Video reached end time');
         return;
@@ -555,8 +628,13 @@ async function playAndCompleteVideo(item, initialProgress) {
 
       if (Date.now() - lastProgressAt > 10000) {
         log('Video playback stalled, attempting to resume');
+        pulseWatchActivity(video);
         await attemptPlayOnVideo(video);
         lastProgressAt = Date.now();
+      }
+
+      if ((Date.now() - start) % 20000 < 3000) {
+        pulseWatchActivity(video);
       }
 
       if (Date.now() - start > getVideoWaitBudgetMs(video)) {
@@ -571,6 +649,10 @@ async function runCycle() {
     return;
   }
   await waitForPageReady();
+  if (!isPageVisibleForTracking()) {
+    log('Automation is paused until the Amdocs tab is visible and focused');
+    return;
+  }
   const progress = getProgressPercent();
   if (progress !== null) {
     log('Current progress:', progress, '%');
@@ -598,6 +680,8 @@ async function runCycle() {
   if (completed) {
     log('Video should be complete; waiting for auto-refresh or other page update.');
     await sleep(5000);
+  } else {
+    log('Video was played but the website did not confirm progress yet; retrying the same lesson next cycle.');
   }
 }
 
